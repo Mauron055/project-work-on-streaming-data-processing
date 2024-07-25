@@ -1,86 +1,27 @@
-import os
-from datetime import datetime
+import logging
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import from_json, to_json, col, lit, struct, unix_timestamp, current_timestamp
 from pyspark.sql.types import StructType, StructField, StringType, LongType
 
-# метод для записи данных в 2 target: в PostgreSQL для фидбэков и в Kafka для триггеров
-def foreach_batch_function(df, epoch_id):
-    # сохраняем df в памяти, чтобы не создавать df заново перед отправкой в Kafka
-    df.persist()
-    # записываем df в PostgreSQL с полем feedback
-    df.write
-        .format('jdbc')
-        .option('url', 'jdbc:postgresql://localhost:5432/de')
-        .option('driver', 'org.postgresql.Driver')
-        .option('dbtable', 'subscribers_feedback')
-        .option('user', 'jovyan')
-        .option('password', 'jovyan')
-        .mode("append")
-        .save()
-    # создаём df для отправки в Kafka. Сериализация в json.
-    df_for_kafka = df.select(
-        "restaurant_id",
-        "adv_campaign_id",
-        "adv_campaign_content",
-        "adv_campaign_owner",
-        "adv_campaign_owner_contact",
-        "adv_campaign_datetime_start",
-        "adv_campaign_datetime_end",
-        "client_id",
-        "datetime_created",
-        "trigger_datetime_created"
-    ).withColumn("value", to_json(struct(
-        "restaurant_id",
-        "adv_campaign_id",
-        "adv_campaign_content",
-        "adv_campaign_owner",
-        "adv_campaign_owner_contact",
-        "adv_campaign_datetime_start",
-        "adv_campaign_datetime_end",
-        "client_id",
-        "datetime_created",
-        "trigger_datetime_created"
-    )))
-    # отправляем сообщения в результирующий топик Kafka без поля feedback
-    df_for_kafka.writeStream
-        .format('kafka')
-        .option('kafka.bootstrap.servers', 'rc1b-2erh7b35n4j4v869.mdb.yandexcloud.net:9091')
-        .option('kafka.security.protocol', 'SASL_SSL')
-        .option('kafka.sasl.jaas.config', 'org.apache.kafka.common.security.scram.ScramLoginModule required username="ваш_username" password="ваш_пароль";')
-        .option('kafka.sasl.mechanism', 'SCRAM-SHA-512')
-        .option('topic', 'ваш_топик_out')
-        .outputMode('append')
-        .start()
-    # очищаем память от df
-    df.unpersist()
+# Настройки
+KAFKA_BOOTSTRAP_SERVERS = 'rc1b-2erh7b35n4j4v869.mdb.yandexcloud.net:9091'
+KAFKA_SECURITY_PROTOCOL = 'SASL_SSL'
+KAFKA_SASL_JAAS_CONFIG = 'org.apache.kafka.common.security.scram.ScramLoginModule required username="ваш_username" password="ваш_пароль";'
+KAFKA_SASL_MECHANISM = 'SCRAM-SHA-512'
+KAFKA_TOPIC_IN = 'ваш_топик_in'
+KAFKA_TOPIC_OUT = 'ваш_топик_out'
 
-# необходимые библиотеки для интеграции Spark с Kafka и PostgreSQL
-spark_jars_packages = ",".join(
-        [
-            "org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0",
-            "org.postgresql:postgresql:42.4.0",
-        ]
-    )
+POSTGRES_URL = 'jdbc:postgresql://localhost:5432/de'
+POSTGRES_DRIVER = 'org.postgresql.Driver'
+POSTGRES_TABLE_FEEDBACK = 'subscribers_feedback'
+POSTGRES_USER = 'jovyan'
+POSTGRES_PASSWORD = 'jovyan'
 
-# создаём spark сессию с необходимыми библиотеками в spark_jars_packages для интеграции с Kafka и PostgreSQL
-spark = SparkSession.builder
-    .appName("RestaurantSubscribeStreamingService")
-    .config("spark.sql.session.timeZone", "UTC")
-    .config("spark.jars.packages", spark_jars_packages)
-    .getOrCreate()
+# Настройка логирования
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
 
-# читаем из топика Kafka сообщения с акциями от ресторанов
-restaurant_read_stream_df = spark.readStream
-    .format('kafka')
-    .option('kafka.bootstrap.servers', 'rc1b-2erh7b35n4j4v869.mdb.yandexcloud.net:9091')
-    .option('kafka.security.protocol', 'SASL_SSL')
-    .option('kafka.sasl.jaas.config', 'org.apache.kafka.common.security.scram.ScramLoginModule required username="ваш_username" password="ваш_пароль";')
-    .option('kafka.sasl.mechanism', 'SCRAM-SHA-512')
-    .option('subscribe', 'ваш_топик_in')
-    .load()
-
-# определяем схему входного сообщения для json
+# Схема входного сообщения из Kafka
 incomming_message_schema = StructType([
     StructField("restaurant_id", StringType(), True),
     StructField("adv_campaign_id", StringType(), True),
@@ -92,45 +33,127 @@ incomming_message_schema = StructType([
     StructField("datetime_created", LongType(), True)
 ])
 
-# определяем текущее время в UTC в миллисекундах, затем округляем до секунд
-current_timestamp_utc = int(round(unix_timestamp(current_timestamp())))
+def create_spark_session():
+    """Создает SparkSession."""
+    spark = SparkSession.builder 
+        .appName("RestaurantSubscribeStreamingService") 
+        .config("spark.sql.session.timeZone", "UTC") 
+        .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.0,org.postgresql:postgresql:42.4.0") 
+        .getOrCreate()
+    return spark
 
-# десериализуем из value сообщения json и фильтруем по времени старта и окончания акции
-filtered_read_stream_df = restaurant_read_stream_df.selectExpr(
-    "CAST(key AS STRING) as key",
-    "CAST(value AS STRING) as value"
-).withColumn("value", from_json(col("value"), incomming_message_schema))
-.filter(col("value.adv_campaign_datetime_start") <= current_timestamp_utc)
-.filter(col("value.adv_campaign_datetime_end") >= current_timestamp_utc)
-.select("value.*")
+def read_kafka_stream(spark):
+    """Читает данные из Kafka-стрима."""
+    restaurant_read_stream_df = spark.readStream 
+        .format('kafka') 
+        .option('kafka.bootstrap.servers', KAFKA_BOOTSTRAP_SERVERS) 
+        .option('kafka.security.protocol', KAFKA_SECURITY_PROTOCOL) 
+        .option('kafka.sasl.jaas.config', KAFKA_SASL_JAAS_CONFIG) 
+        .option('kafka.sasl.mechanism', KAFKA_SASL_MECHANISM) 
+        .option('subscribe', KAFKA_TOPIC_IN) 
+        .load()
+    return restaurant_read_stream_df
 
-# вычитываем всех пользователей с подпиской на рестораны
-subscribers_restaurant_df = spark.read
-                    .format('jdbc')
-                      .option('url', 'jdbc:postgresql://localhost:5432/de')
-                    .option('driver', 'org.postgresql.Driver')
-                    .option('dbtable', 'subscribers_restaurants')
-                    .option('user', 'jovyan')
-                    .option('password', 'jovyan')
-                    .load()
+def filter_stream_data(df):
+    """Фильтрация данных из Kafka-стрима по времени действия акции."""
+    current_timestamp_utc = int(round(unix_timestamp(current_timestamp())))
+    filtered_data = df.selectExpr(
+        "CAST(key AS STRING) as key",
+        "CAST(value AS STRING) as value"
+    ).withColumn("value", from_json(col("value"), incomming_message_schema)) \
+    .filter(col("value.adv_campaign_datetime_start") <= current_timestamp_utc) \
+    .filter(col("value.adv_campaign_datetime_end") >= current_timestamp_utc) \
+    .select("value.*")
+    return filtered_data
 
-# джойним данные из сообщения Kafka с пользователями подписки по restaurant_id (uuid). Добавляем время создания события.
-result_df = filtered_read_stream_df.join(subscribers_restaurant_df, on=filtered_read_stream_df["restaurant_id"] == subscribers_restaurant_df["restaurant_id"], how="inner")
-        .select(
-            filtered_read_stream_df["restaurant_id"],
-            filtered_read_stream_df["adv_campaign_id"],
-            filtered_read_stream_df["adv_campaign_content"],
-            filtered_read_stream_df["adv_campaign_owner"],
-            filtered_read_stream_df["adv_campaign_owner_contact"],
-            filtered_read_stream_df["adv_campaign_datetime_start"],
-            filtered_read_stream_df["adv_campaign_datetime_end"],
-            subscribers_restaurant_df["client_id"],
-            filtered_read_stream_df["datetime_created"],
-            lit(current_timestamp_utc).alias("trigger_datetime_created")
-        )
+def read_subscribers_data(spark):
+    """Читает данные о подписчиках из PostgreSQL."""
+    subscribers_restaurant_df = spark.read \
+                        .format('jdbc') \
+                          .option('url', POSTGRES_URL) \
+                        .option('driver', POSTGRES_DRIVER) \
+                        .option('dbtable', 'subscribers_restaurants') \
+                        .option('user', POSTGRES_USER) \
+                        .option('password', POSTGRES_PASSWORD) \
+                        .load()
+    return subscribers_restaurant_df
 
-# запускаем стриминг
-result_df.writeStream
-    .foreachBatch(foreach_batch_function)
-    .start()
-    .awaitTermination()
+def join_and_transform_data(filtered_data, subscribers_data):
+    """Объединяет и преобразовывает данные."""
+    result_df = filtered_data.join(subscribers_data, on=filtered_data["restaurant_id"] == subscribers_data["restaurant_id"], how="inner") \
+            .select(
+                filtered_data["restaurant_id"],
+                filtered_data["adv_campaign_id"],
+                filtered_data["adv_campaign_content"],
+                filtered_data["adv_campaign_owner"],
+                filtered_data["adv_campaign_owner_contact"],
+                filtered_data["adv_campaign_datetime_start"],
+                filtered_data["adv_campaign_datetime_end"],
+                subscribers_data["client_id"],
+                filtered_data["datetime_created"],
+                lit(int(round(unix_timestamp(current_timestamp())))).alias("trigger_datetime_created")
+            )
+    return result_df
+
+def write_to_postgresql(df):
+    """Сохраняет данные в PostgreSQL."""
+    try:
+        df.write \
+            .format('jdbc') \
+            .option('url', POSTGRES_URL) \
+            .option('driver', POSTGRES_DRIVER) \
+            .option('dbtable', POSTGRES_TABLE_FEEDBACK) \
+            .option('user', POSTGRES_USER) \
+            .option('password', POSTGRES_PASSWORD) \
+            .mode("append") \
+            .save()
+    except Exception as e:
+        logger.error(f"Error writing to PostgreSQL: {str(e)}")
+
+def write_to_kafka(df):
+    """Сохраняет данные в Kafka."""
+    try:
+        df_kafka = df.select(to_json(struct(
+            "restaurant_id",
+            "adv_campaign_id",
+            "adv_campaign_content",
+            "adv_campaign_owner",
+            "adv_campaign_owner_contact",
+            "adv_campaign_datetime_start",
+            "adv_campaign_datetime_end",
+            "client_id",
+            "datetime_created",
+            "trigger_datetime_created"
+        )).alias('value'))
+        df_kafka \
+            .writeStream \
+            .format('kafka') \
+            .option('kafka.bootstrap.servers', KAFKA_BOOTSTRAP_SERVERS) \
+            .option('kafka.security.protocol', KAFKA_SECURITY_PROTOCOL) \
+            .option('kafka.sasl.jaas.config', KAFKA_SASL_JAAS_CONFIG) \
+            .option('kafka.sasl.mechanism', KAFKA_SASL_MECHANISM) \
+            .option('topic', KAFKA_TOPIC_OUT) \
+            .outputMode('append') \
+            .start()
+    except Exception as e:
+        logger.error(f"Error writing to Kafka: {str(e)}")
+
+def save_to_postgresql_and_kafka(df):
+    """Сохраняет данные в PostgreSQL и Kafka."""
+    df.persist()
+    write_to_postgresql(df)
+    write_to_kafka(df)
+    df.unpersist()
+
+def main():
+    """Основная функция."""
+    spark = create_spark_session()
+    restaurant_read_stream_df = read_kafka_stream(spark)
+    filtered_data = filter_stream_data(restaurant_read_stream_df)
+    subscribers_data = read_subscribers_data(spark)
+    result_df = join_and_transform_data(filtered_data, subscribers_data)
+    save_to_postgresql_and_kafka(result_df)
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
